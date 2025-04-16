@@ -1,5 +1,8 @@
 # Ignoruj folder .vs (Visual Studio)
 .vs/
+# ignoruj folder .vs w każdym miejscu
+**/.vs/
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
