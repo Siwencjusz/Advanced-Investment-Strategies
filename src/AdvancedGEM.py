@@ -64,6 +64,11 @@ GEM_ASSETS = {
     "Cash": "BIL"
 }
 
+GEM_DCA_ASSETS = {
+    "VWCE": "VWCE",
+    "Obligacje": "EUNA"
+}
+
 GEM_MOMENTUM = {
     "Momentum Factor": "IWMO.UK",    
     "Obligacje": "TLT",
@@ -352,6 +357,28 @@ class GEMStrategy(InvestmentStrategy):
             return {"Cash": self.amount}
         ssum = top.sum()
         return {k: round(v / ssum * self.amount, 2) for k, v in top.items()}
+
+
+class GEMDCAStrategy(InvestmentStrategy):
+    """Prosta strategia GEM – wybiera topN aktywów z GEM_ASSETS, resztę alokuje w Cash."""
+    def __init__(self, assets=GEM_DCA_ASSETS, topn=3, amount=100):
+        self.assets = assets
+        self.topn = topn
+        self.amount = amount
+
+    def run(self):
+        scores = {}
+        for name, tkr in self.assets.items():
+            data = DataFetcher.fetch_yf(tkr)
+            if not data.empty:
+                scores[name] = MomentumCalculator.gem_momentum(data)
+        sr = pd.Series(scores).sort_values(ascending=False)
+        top = sr[sr > 0].head(self.topn)
+        if top.empty:
+            return {"Cash": self.amount}
+        ssum = top.sum()
+        return {k: round(v / ssum * self.amount, 2) for k, v in top.items()}
+
 
 # --- 5) SmartGEMStrategy ---
 class SmartGEMStrategy(InvestmentStrategy):
@@ -758,22 +785,32 @@ final_wrapped_strategy = FinalStrategyWrapper(
         TAAStrategy(), 
         PartialAllocator(
             HysteresisDecorator(SmartPriorityTAAStrategy(), threshold=5.0), 
-            fraction=0.95, 
+            fraction=0.99, 
             safe_asset="Cash"
         ), 
-        # PartialAllocator(
-        #     HysteresisDecorator(SmartGEMStrategyTAA(), threshold=5.0), 
-        #     fraction=0.8, 
-        #     safe_asset="Cash"
-        # ), 
+        PartialAllocator(
+            HysteresisDecorator(SmartGEMStrategyTAA(), threshold=5.0), 
+            fraction=0.99, 
+            safe_asset="Cash"
+        ), 
         PartialAllocator(
             HysteresisDecorator(SmartGoldenTAA(), threshold=5.0), 
-            fraction=0.95, 
+            fraction=0.99, 
             safe_asset="Cash"
         ), 
         PartialAllocator(
             HysteresisDecorator(SmartPriorityTAAStrategy(), threshold=5.0), 
-            fraction=0.95, 
+            fraction=0.99, 
+            safe_asset="Cash"
+        ), 
+        PartialAllocator(
+            HysteresisDecorator(TAAStrategy(), threshold=5.0), 
+            fraction=0.99, 
+            safe_asset="Cash"
+        ), 
+        PartialAllocator(
+            HysteresisDecorator(MomentumTAAStrategy(), threshold=5.0), 
+            fraction=0.99, 
             safe_asset="Cash"
         )
     )
@@ -1049,23 +1086,24 @@ if __name__ == "__main__":
 
     # Lista strategii do przetestowania
     all_strats = [
-        #("TAA (Heurystyka)", TAAStrategy()),
-        #("TAA (Momentum)", MomentumTAAStrategy()),
-        ("TAA (Smart Priority)", SmartPriorityTAAStrategy()),
-        ("TAA (SmartGoldenTAA)", SmartGoldenTAA()),
-        ("SmartGEMStrategyTAA", SmartGEMStrategyTAA()),
-        ("SuperIKE GEM", SuperIKEStrategy()),
-        ("Crypto", CryptoStrategy()),
+
         ("DCA", DCAStrategy()),
         ("IKZE Żony", EDOStrategy()),
+        ("Crypto", CryptoStrategy()),        
+        ("SuperIKE GEM", SuperIKEStrategy()),        
+        ("Enchanced SuperIKE", EnhancedSmartStrategy(SuperIKEStrategy())),
         #("Enchanced DCAStrategy", EnhancedSmartStrategy(DCAStrategy())),
         #("Enchanced TAAStrategy", EnhancedSmartStrategy(TAAStrategy())),
         ("Enchanced MomentumTAAStrategy", EnhancedSmartStrategy(MomentumTAAStrategy())),
-        ("Enchanced SmartPriorityTAAStrategy", EnhancedSmartStrategy(SmartPriorityTAAStrategy())),
-        ("Enchanced SmartGoldenTAA", EnhancedSmartStrategy(SmartGoldenTAA())),
+        ("TAA (Heurystyka)", TAAStrategy()),
+        ("TAA (Momentum)", MomentumTAAStrategy()),
+        ("TAA (Smart Priority)", SmartPriorityTAAStrategy()),
+        ("TAA (SmartGoldenTAA)", SmartGoldenTAA()),
+        ("SmartGEMStrategyTAA", SmartGEMStrategyTAA()),
+        # ("Enchanced SmartPriorityTAAStrategy", EnhancedSmartStrategy(SmartPriorityTAAStrategy())),
+        # ("Enchanced SmartGoldenTAA", EnhancedSmartStrategy(SmartGoldenTAA())),
         #("Enchanced SmartGEMStrategyTAA", EnhancedSmartStrategy(SmartGEMStrategyTAA())),
-        #("Enchanced Crypto", EnhancedSmartStrategy(CryptoStrategy())),
-        ("Enchanced SuperIKE", EnhancedSmartStrategy(SuperIKEStrategy())),
+        #("Enchanced Crypto", EnhancedSmartStrategy(CryptoStrategy())),        
         ("Final Wrapped Strategy", final_wrapped_strategy)
     ]
 
@@ -1086,10 +1124,10 @@ if __name__ == "__main__":
 
 
     my_strategies = [
-        (DCAStrategy(), 0.2),
+        (DCAStrategy(), 0.2025),
         (SmartGoldenTAA(), 0.15),
         (SmartGEMStrategyTAA(), 0.145),
-        (CryptoStrategy(), 0.005),
+        (CryptoStrategy(), 0.0025),
         (EDOStrategy(), 0.075),
         (EDOStrategy(), 0.05),
         (EDOStrategy(), 0.25),
@@ -1131,3 +1169,14 @@ if __name__ == "__main__":
     sideways, sw_msg = enhanced.is_sideways_market(ticker="SPY", range_window_months=6)
     print(sw_msg)
     logging.info("Tracing/Monitoring: Test Enhanced Strategy zakończony.")
+
+
+    # Parametry:
+    # Cotygodniowa_kwota: 1250 PLN
+    # Strategie:
+    # TAA:   45%   # 562,50 PLN 150 usd 600 usd
+    # GEM:   27,5% # 343,75 PLN 80 eur 320 eur
+    # DCA:   25%   # 312,50 PLN 75 eur 300 eur
+    # AEM:   2,5%  # 31,25 PLN  15 eur 60 eur
+    # Dni_offset: [0, 7, 14, 21, 28]  # od 20.
+    # Godzina: 11:00
