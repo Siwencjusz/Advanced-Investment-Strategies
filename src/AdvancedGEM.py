@@ -28,6 +28,7 @@ import numpy as np
 from datetime import datetime
 from pandas_datareader import data as pdr
 from abc import ABC, abstractmethod
+from typing import Dict, List
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -38,12 +39,12 @@ START_DATE = "2023-01-01"
 TODAY = datetime.today().strftime("%Y-%m-%d")
 
 TAA_ALLOCATIONS = {
-    "Przewartościowany": {"Akcje": 6,   "Obligacje": 32, "Złoto": 32, "Cash": 30},
-    "Bardzo Wysoki":     {"Akcje": 20,  "Obligacje": 28, "Złoto": 28, "Cash": 24},
-    "Średnio-Wysoki":    {"Akcje": 40,  "Obligacje": 20, "Złoto": 20, "Cash": 20},
-    "Średni":            {"Akcje": 60,  "Obligacje": 15, "Złoto": 15, "Cash": 10},
-    "Średnio-Niski":     {"Akcje": 80,  "Obligacje": 7,  "Złoto": 7,  "Cash": 6},
-    "Bardzo Niski":      {"Akcje": 100, "Obligacje": 0,  "Złoto": 0,  "Cash": 0}
+    "Przewartościowany": {"Akcje": 6,   "Obligacje": 32, "Gold": 32, "Cash": 30},
+    "Bardzo Wysoki":     {"Akcje": 20,  "Obligacje": 28, "Gold": 28, "Cash": 24},
+    "Średnio-Wysoki":    {"Akcje": 40,  "Obligacje": 20, "Gold": 20, "Cash": 20},
+    "Średni":            {"Akcje": 60,  "Obligacje": 15, "Gold": 15, "Cash": 10},
+    "Średnio-Niski":     {"Akcje": 80,  "Obligacje": 7,  "Gold": 7,  "Cash": 6},
+    "Bardzo Niski":      {"Akcje": 100, "Obligacje": 0,  "Gold": 0,  "Cash": 0}
 }
 
 ALT_MAPPING_TAA = {
@@ -56,7 +57,7 @@ ALT_MAPPING_TAA = {
 }
 
 GEM_ASSETS = {
-    "S&P 500": "SPY",
+    "SPY": "SPY",
     "ACWI ex-US": "ACWX",
     "Emerging": "EEM",
     "Obligacje": "TLT",
@@ -77,10 +78,10 @@ GEM_MOMENTUM = {
 }
 
 CRYPTO_GEM_ETFS = {"Crypto": "VBTC.DE", "Cash": "BIL"}
-IKZE_GEM_ETFS = {"USA (SPY)": "SPY", "ex-US (ACWX)": "ACWX", "Emerging": "EEM", "Gold (GLD)": "GLD", "Obligacje": "TLT", "Cash (BIL)": "BIL"}
+IKZE_GEM_ETFS = {"SPY": "SPY", "ACWI ex-US": "ACWX", "Emerging": "EEM", "Gold ": "GLD", "Obligacje": "TLT", "Cash ": "BIL"}
 
 SuperIKE_GEM_ETFS = {
-    "USA (SPY)": "SPY",
+    "SPY": "SPY",
     "Gold": "GLD",
     "Beta CASH": "ETFBCASH.WA",
     "TBSP": "ETFBTBSP.WA",
@@ -170,6 +171,114 @@ class InvestmentStrategy(ABC):
     def run(self):
         pass
 
+
+
+class RPTCStrategy(InvestmentStrategy):
+    """Strategia Risk-Parity Trend-Cut (global / local) z fallbackiem do 100% Cash, jeśli danych za mało."""
+    def __init__(self, variant='global', amount=100):
+        self.variant = variant
+        self.amount = amount
+        self.assets_map = {
+            "global": {
+                "Akcje": "ACWI",
+                "Cash": "TIP",
+                "Obligacje": "TLT",#"IGLB",
+                "Gold": "GLD",
+                "Commodities": "COMT",
+                "SG_Trend": "DBMF"
+            },
+            "local": {
+                "ACWI": "ACWI",     # global equities
+                "Cash": "TIP",     # euro inflation-linked bonds
+                "Obligacje": "ETFBTBSP.WA",  # Polish TBSP
+                "Gold": "SGLN",     # Gold
+                "Commodities": "COMT",  # placeholder, np. WisdomTree Broad Commodities
+                "SG_Trend": "DBMF"  # pozostaje jako proxy
+            }
+        }
+
+    def _get_prices(self) -> pd.DataFrame:
+        tickers = list(self.assets_map[self.variant].values())
+        df = pd.DataFrame()
+        for name, tkr in self.assets_map[self.variant].items():
+            series = DataFetcher.fetch_yf(tkr)
+            df[name] = series
+        df = df.resample('M').last()
+        df = df.dropna(thresh=int(0.8 * len(df.columns)))  # min. 80% danych
+
+        return df
+
+    def run(self):
+        prices = self._get_prices()
+        frame = 36
+        minFrame = 18
+
+        if prices.empty or len(prices) < minFrame:
+            logging.warning("RPTC: za mało danych do obliczeń – fallback do 100% Cash")
+            return {"Cash": 100}
+
+        if len(prices) < frame:
+            frame = len(prices) - 1
+        
+        if len(prices) < minFrame:
+            logging.warning("RPTC: zbyt mało danych – fallback do 100% Cash")
+            return {"Cash": 100}
+        
+        returns = prices.pct_change().dropna()
+
+        # 1. rolling frame m vol
+        vol = returns.rolling(frame).std(ddof=0) * np.sqrt(12)
+        inv_vol = 1 / vol
+        base_weights = inv_vol.div(inv_vol.sum(axis=1), axis=0).dropna()
+
+        # 2. cap 45%
+        capped = base_weights.clip(upper=0.45)
+        capped = capped.div(capped.sum(axis=1), axis=0)
+
+        # 3. trend filter (12m total return < 0 → halve weight)
+        total_ret = (1 + returns).rolling(12).apply(np.prod) - 1
+        trend_mask = (total_ret < 0).shift(1).fillna(False)
+        trend_cut = capped.copy()
+        trend_cut[trend_mask] *= 0.5
+
+        # 4. normalize
+        w_normalized = trend_cut.div(trend_cut.sum(axis=1), axis=0)
+
+        # 5. cov matrix and leverage
+        cov = returns.rolling(frame).cov() * 12  # annualized
+        weights = []
+
+        for date in w_normalized.index:
+            row = w_normalized.loc[date]
+            sub_cov = cov.loc[date]
+            cov_matrix = sub_cov.reindex(index=row.index, columns=row.index).fillna(0)
+            port_var = row.T @ cov_matrix @ row
+            port_vol = np.sqrt(port_var) if port_var > 0 else 1
+            lev = min(1.3, 0.12 / port_vol)
+            final = row * lev
+            weights.append(final)
+
+        final_df = pd.DataFrame(weights, index=w_normalized.index).round(4)
+        if final_df.empty:            
+            logging.warning("RPTC: brak wyników po przeliczeniu – fallback do 100% Cash")
+            return {"Cash": 100}
+
+        latest = final_df.iloc[-1]
+        scaled = {k: round(v * self.amount, 2) for k, v in latest.items()}
+        total = sum(scaled.values())
+        
+        if total > 0:
+            scaled = {k: round(v / total * 100, 2) for k, v in scaled.items()}
+        else:
+            scaled = {"Cash": 100}
+        return scaled
+    
+
+
+
+
+
+
 # --- 1) TAAStrategy ---
 class TAAStrategy(InvestmentStrategy):
     """Heurystyka TAA: uwzględnia momentum SPY, ryzyko (VIX, FRED) oraz wycenę."""
@@ -244,7 +353,7 @@ class TAAStrategy(InvestmentStrategy):
 class MomentumTAAStrategy(InvestmentStrategy):
     """Strategia TAA oparta wyłącznie na momentum dla wybranych aktywów."""
     def __init__(self):
-        self.assets = {"ACWI": "Akcje", "TLT": "Obligacje", "GLD": "Złoto", "SHV": "Cash"}
+        self.assets = {"ACWI": "Akcje", "TLT": "Obligacje", "GLD": "Gold", "SHV": "Cash"}
         self.bounds = {"ACWI": (0.05, 1), "TLT": (0.05, 0.55), "GLD": (0.05, 0.85), "SHV": (0.05, 0.55)}
         self.priority = ["ACWI", "TLT", "GLD", "SHV"]
 
@@ -510,39 +619,82 @@ def get_current_pe(ticker: str = "SPY") -> float:
         logging.error(f"Błąd pobierania P/E dla {ticker}: {e}")
         return 0.0
 
+import logging, numpy as np
+from typing import Dict, List
+
+# założenie: masz już InvestmentStrategy, DataFetcher.fetch_yf, 
+# MomentumCalculator.taa_momentum, get_current_pe
+
 class DCAStrategy(InvestmentStrategy):
-    """Strategia DCA – ustalanie proporcji na podstawie momentum SPY i aktualnego P/E."""
-    def run(self):
-        spy = DataFetcher.fetch_yf("SPY")
-        if spy.empty:
-            return "pauza"
-        sc = MomentumCalculator.taa_momentum(spy)
-        pe = get_current_pe("SPY")
-        logging.info(f"Aktualny wskaźnik P/E dla SPY: {pe:.2f}")
-        if pe > 30:
-            if sc > 0.18:
-                return "80/20"
-            elif sc > 0.09:
-                return "60/40"
-            elif sc > 0.045:
-                return "40/60"
-            elif sc > 0.0225:
-                return "20/80"
-            else:
-                return "pauza"
+    """
+    KISS-DCA  – bez fetch_multi, tylko fetch_yf
+    ───────────────────────────────────────────────────────────
+    • Valuation: bieżący P/E SPY
+        PE > 30   → baza 60 % akcji
+        PE ≤ 30   → baza 80 % akcji
+    • Momentum: średnia 12 m TR z (SPY, ACWI, QQQ),
+      wygładzona prostą ema = 0.3, liczoną na bieżąco
+    • Equity  = base + 0.20 × clip(mom/0.15, −1, 1)
+      (zakres 20 % … 100 %)
+    • Soft-delta-limit: zmiana wagi maks. ±25 pp na miesiąc
+    """
+
+    # -- parametry, jeden ekran --
+    PE_HIGH   = 30.0     # „drogi” rynek
+    MOM_SCALE = 0.15     # 15 % TR ⇒ pełne ±20 pp korekty
+    MAX_STEP  = 0.25     # limit zmiany m/m
+    MIN_EQ    = 0.20
+    MAX_EQ    = 1.00
+    ALPHA     = 0.3      # wygładzenie EMA
+
+    _prev_eq: float | None = None   # stan zapamiętany pomiędzy wywołaniami
+    _prev_ema: float | None = None
+
+    # ---------------------------------------------------------
+    def _multi_momentum(self, tickers: List[str]) -> float:
+        """Średni 12-m momentum z listy tickerów (ignoruje brakujące)."""
+        vals = []
+        for t in tickers:
+            ser = DataFetcher.fetch_yf(t)
+            if ser.empty:
+                logging.warning("Brak danych %s – pomijam w momentum", t)
+                continue
+            vals.append(MomentumCalculator.taa_momentum(ser))
+        return float(np.mean(vals)) if vals else 0.0
+
+    def run(self) -> Dict[str, float]:
+        # 1️⃣ momentum
+        mom_raw = self._multi_momentum(["SPY", "ACWI", "QQQ"])
+
+        # EMA wygładzenie (bez zewnętrznych bibliotek)
+        if self._prev_ema is None:
+            mom = mom_raw
         else:
-            if sc > 0.18:
-                return "100/0"
-            elif sc > 0.09:
-                return "80/20"
-            elif sc > 0.045:
-                return "60/40"
-            elif sc > 0.0225:
-                return "40/60"
-            elif sc > 0.01125:
-                return "20/80"
-            else:
-                return "pauza"
+            mom = self.ALPHA * mom_raw + (1 - self.ALPHA) * self._prev_ema
+        self._prev_ema = mom
+
+        # 2️⃣ valuation
+        pe_now = get_current_pe("SPY")
+        if pe_now is None:
+            logging.warning("Brak P/E – pauza (100 % obligacji)")
+            return {"Akcje": 0.0, "Obligacje": 100.0}
+
+        base = 0.60 if pe_now > self.PE_HIGH else 0.80
+
+        # 3️⃣ korekta momentum
+        adj    = np.clip(mom / self.MOM_SCALE, -1, 1)
+        equity = np.clip(base + 0.20 * adj, self.MIN_EQ, self.MAX_EQ)
+
+        # 4️⃣ soft-delta-limit
+        if self._prev_eq is not None:
+            equity = np.clip(equity,
+                             self._prev_eq - self.MAX_STEP,
+                             self._prev_eq + self.MAX_STEP)
+        self._prev_eq = equity
+
+        logging.info("PE %.2f | MOM %.3f | EQ %.2f", pe_now, mom, equity)
+        return {"Akcje": 100 * round(equity, 3),
+                "Obligacje":   100 * round(1.0 - equity, 3)}
 
 # --- 11) EDOStrategy ---
 class EDOStrategy(InvestmentStrategy):
@@ -555,15 +707,15 @@ class SmartGoldenTAA(InvestmentStrategy):
     """
     Strategia SmartGoldenTAA (dynamiczny Golden Butterfly):
       - ~60% akcji (VTI)
-      - 30% złoto (GLD)
+      - 30% Gold 
       - 10% obligacje (TLT)
-      - 0% Cash (BIL)
+      - 0% Cash 
       + overlay momentum
     """
     def __init__(self, amount=100):
         self.amount = amount
-        self.assets = {"Akcje": "VTI", "Złoto": "GLD", "Obligacje": "TLT", "Cash": "BIL"}
-        self.target_alloc = {"Akcje": 0.6, "Złoto": 0.3, "Obligacje": 0.1, "Cash": 0}
+        self.assets = {"Akcje": "VTI", "Gold": "GLD", "Obligacje": "TLT", "Cash": "BIL"}
+        self.target_alloc = {"Akcje": 0.6, "Gold": 0.3, "Obligacje": 0.1, "Cash": 0}
 
     def run(self):
         scores = {}
@@ -812,6 +964,11 @@ final_wrapped_strategy = FinalStrategyWrapper(
             HysteresisDecorator(MomentumTAAStrategy(), threshold=5.0), 
             fraction=0.99, 
             safe_asset="Cash"
+        ), 
+        PartialAllocator(
+            HysteresisDecorator(RPTCStrategy(variant="global"), threshold=5.0), 
+            fraction=0.99, 
+            safe_asset="Cash"
         )
     )
 )
@@ -828,18 +985,11 @@ class EffectivenessMixin:
     def get_ticker_for_asset(self, asset: str) -> str:
         mapping = {
             "SPY": "SPY",
-            "S&P 500": "SPY",
-            "USA (SPY)": "SPY",
             "Akcje": "SPY",
             "Obligacje": "TLT",
-            "Złoto": "GLD",
             "Gold": "GLD",
-            "Gold (GLD)": "GLD",
             "Cash": "BIL",
-            "Cash": "BIL",
-            "Cash (BIL)": "BIL",
             "ACWI ex-US": "ACWX",
-            "ex-US (ACWX)": "ACWX",
             "Emerging": "EEM",
             "Crypto": "VBTC.DE",
             "Obligacje EDO": "Obligacje EDO",
@@ -1087,26 +1237,29 @@ if __name__ == "__main__":
     # Lista strategii do przetestowania
     all_strats = [
 
-        ("DCA", DCAStrategy()),
-        ("IKZE Żony", EDOStrategy()),
-        ("Crypto", CryptoStrategy()),        
-        ("SuperIKE GEM", SuperIKEStrategy()),        
-        ("Enchanced SuperIKE", EnhancedSmartStrategy(SuperIKEStrategy())),
-        #("Enchanced DCAStrategy", EnhancedSmartStrategy(DCAStrategy())),
-        #("Enchanced TAAStrategy", EnhancedSmartStrategy(TAAStrategy())),
-        ("Enchanced MomentumTAAStrategy", EnhancedSmartStrategy(MomentumTAAStrategy())),
-        ("TAA (Heurystyka)", TAAStrategy()),
-        ("TAA (Momentum)", MomentumTAAStrategy()),
-        ("TAA (Smart Priority)", SmartPriorityTAAStrategy()),
-        ("TAA (SmartGoldenTAA)", SmartGoldenTAA()),
-        ("SmartGEMStrategyTAA", SmartGEMStrategyTAA()),
-        # ("Enchanced SmartPriorityTAAStrategy", EnhancedSmartStrategy(SmartPriorityTAAStrategy())),
-        # ("Enchanced SmartGoldenTAA", EnhancedSmartStrategy(SmartGoldenTAA())),
-        #("Enchanced SmartGEMStrategyTAA", EnhancedSmartStrategy(SmartGEMStrategyTAA())),
-        #("Enchanced Crypto", EnhancedSmartStrategy(CryptoStrategy())),        
-        ("Final Wrapped Strategy", final_wrapped_strategy)
-    ]
+         ("DCA", DCAStrategy()),
+         ("IKZE Żony", EDOStrategy()),
+         ("Crypto", CryptoStrategy()),        
+         ("SuperIKE GEM", SuperIKEStrategy()),        
+    #     ("Enchanced SuperIKE", EnhancedSmartStrategy(SuperIKEStrategy())),
+    #     #("Enchanced DCAStrategy", EnhancedSmartStrategy(DCAStrategy())),
+    #     #("Enchanced TAAStrategy", EnhancedSmartStrategy(TAAStrategy())),
+        
+         ("RPTC Global", RPTCStrategy(variant="global")),
+    #     ("RPTC Lokalny", RPTCStrategy(variant="local")),
 
+         ("Enchanced MomentumTAAStrategy", EnhancedSmartStrategy(MomentumTAAStrategy())),
+         ("TAA (Heurystyka)", TAAStrategy()),
+         ("TAA (Momentum)", MomentumTAAStrategy()),
+         ("TAA (Smart Priority)", SmartPriorityTAAStrategy()),
+         ("TAA (SmartGoldenTAA)", SmartGoldenTAA()),
+         ("SmartGEMStrategyTAA", SmartGEMStrategyTAA()),
+    #     # ("Enchanced SmartPriorityTAAStrategy", EnhancedSmartStrategy(SmartPriorityTAAStrategy())),
+    #     # ("Enchanced SmartGoldenTAA", EnhancedSmartStrategy(SmartGoldenTAA())),
+    #     #("Enchanced SmartGEMStrategyTAA", EnhancedSmartStrategy(SmartGEMStrategyTAA())),
+    #     #("Enchanced Crypto", EnhancedSmartStrategy(CryptoStrategy())),        
+         ("Final Wrapped Strategy", final_wrapped_strategy)
+    ]
     for title, strat in all_strats:
         runner.run_and_log(title, strat)
 
